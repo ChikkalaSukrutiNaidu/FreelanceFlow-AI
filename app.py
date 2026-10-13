@@ -650,6 +650,215 @@ def render_invoice_markdown(data: dict) -> str:
     return "\n".join(md)
 
 
+# -----------------------------------------------------------------------------
+# 2.2 Feature Helper Functions (Expense, Reminder, Monthly Summary)
+# -----------------------------------------------------------------------------
+def build_expense_categorizer_prompts(
+    raw_expense_text: str,
+    tax_jurisdiction: str = "Not specified",
+) -> tuple[str, str]:
+    """
+    Builds the system and user prompts for the Expense Categorizer.
+    Enforces jurisdiction-awareness, labels deductibility as 'Needs verification'
+    when jurisdiction is unspecified, and mandates a non-definitive tax disclaimer.
+    """
+    jurisdiction_clean = tax_jurisdiction.strip() if tax_jurisdiction else "Not specified"
+    is_specified = bool(jurisdiction_clean and jurisdiction_clean.lower() != "not specified")
+
+    if is_specified:
+        jurisdiction_rules = (
+            f"The user has specified their tax jurisdiction as: '{jurisdiction_clean}'.\n"
+            "- In the Potential Deductibility column, provide standard general guidelines relevant to this jurisdiction.\n"
+            "- CRITICAL NON-LEGAL RULE: Do NOT make definitive tax claims such as 'fully deductible', '100% deductible', '50% deductible', or guaranteed qualification for specific tax provisions (such as Section 179). Actual eligibility depends on individual business structure, filing thresholds, and local tax rules."
+        )
+    else:
+        jurisdiction_rules = (
+            "The user has NOT specified a tax jurisdiction.\n"
+            "- In the Potential Deductibility column, you MUST label every expense strictly as 'Needs verification'.\n"
+            "- CRITICAL RULE: Do NOT make definitive tax deductibility claims (such as 'fully deductible', '50% deductible', or citing specific national tax codes like Section 179) because deductibility rules differ fundamentally across jurisdictions."
+        )
+
+    system_prompt = (
+        "You are an expense organization and bookkeeping assistant for freelancers and independent contractors.\n"
+        "Examine the list of transactions and present them in a clean markdown table with these exact columns:\n"
+        "- Date\n"
+        "- Description\n"
+        "- Amount ($)\n"
+        "- Expense Category (e.g., Software & Subscriptions, Office Supplies, Meals & Client Meetings, Travel, Equipment, Hosting/Infrastructure)\n"
+        "- Potential Deductibility (Follow jurisdiction guidelines below)\n"
+        "- Documentation Recommendation (e.g., 'Keep itemized receipt', 'Log business purpose')\n\n"
+        f"{jurisdiction_rules}\n\n"
+        "After the table, provide:\n"
+        "1. Total Expenses ($) - mathematical sum of all listed items\n"
+        "2. Spending Breakdown by Category\n"
+        "3. Practical Bookkeeping Guidance (receipt retention, business/personal separation).\n\n"
+        "MANDATORY DISCLAIMER:\n"
+        "Conclude your response with this exact disclaimer:\n"
+        "> ⚠️ **General Disclaimer:** Expense categorizations and potential deductibility notes are for informational and organizational purposes only and do not constitute formal tax, accounting, or legal advice. Deductibility varies based on your specific jurisdiction, filing status, and business structure. Consult a certified public accountant (CPA) or local tax professional."
+    )
+
+    user_prompt = f"Tax Jurisdiction: {jurisdiction_clean}\n\nRaw Expense Records:\n{raw_expense_text}"
+    return system_prompt, user_prompt
+
+
+def get_payment_reminder_status(
+    due_date: date,
+    current_date: date | None = None,
+) -> tuple[str, int, str]:
+    """
+    Computes the invoice status based on due date and current reference date.
+    Returns:
+        tuple: (status_category, days_count, status_description)
+               status_category: 'upcoming', 'due_today', or 'overdue'
+               days_count: absolute day difference
+               status_description: readable status label
+    """
+    if current_date is None:
+        current_date = date.today()
+
+    delta_days = (due_date - current_date).days
+
+    if delta_days > 0:
+        day_str = f"{delta_days} day" if delta_days == 1 else f"{delta_days} days"
+        return "upcoming", delta_days, f"Upcoming (Due in {day_str})"
+    elif delta_days == 0:
+        return "due_today", 0, "Due Today"
+    else:
+        overdue_days = abs(delta_days)
+        day_str = f"{overdue_days} day" if overdue_days == 1 else f"{overdue_days} days"
+        return "overdue", overdue_days, f"Overdue by {day_str}"
+
+
+def build_payment_reminder_prompts(
+    client_name: str,
+    invoice_id: str,
+    amount_due: float,
+    invoice_due_date: date,
+    reminder_tone: str,
+    additional_context: str = "",
+    current_date: date | None = None,
+) -> tuple[str, str, dict]:
+    """
+    Builds prompts for Payment Reminder.
+    Enforces strict date-awareness (never describes an upcoming invoice as overdue)
+    and strictly forbids inventing bank details, payment links, or late fees.
+    """
+    ref_date = current_date if current_date is not None else date.today()
+    status_cat, days_count, status_label = get_payment_reminder_status(invoice_due_date, ref_date)
+
+    system_prompt = (
+        "You are a professional business communications specialist for independent contractors and freelancers.\n"
+        "Draft an effective, courteous payment reminder message based strictly on the provided details.\n\n"
+        "CRITICAL DATE & TIMING RULES:\n"
+        f"- Reference Date (Today): {ref_date.strftime('%B %d, %Y')}\n"
+        f"- Invoice Due Date: {invoice_due_date.strftime('%B %d, %Y')}\n"
+        f"- Calculated Invoice Status: {status_label}\n"
+        "- If the invoice is 'Upcoming' (due in the future), do NOT describe it as overdue, past due, or late! "
+        "Frame the message as a courteous advance reminder of the upcoming due date.\n"
+        "- If the invoice is 'Due Today', state clearly that payment is due today.\n"
+        "- If the invoice is 'Overdue', politely note that the invoice is overdue by the calculated number of days.\n\n"
+        "CRITICAL NON-FABRICATION & PLACEHOLDER RULES:\n"
+        "- Do NOT invent bank details, account numbers, routing numbers, Stripe/PayPal payment URLs, client contact details, phone numbers, email addresses, or late-fee policies.\n"
+        "- If payment methods, payment links, contact numbers, or sender name are not provided in the inputs, use clear bracketed placeholders: "
+        "[Your Name], [Your Email / Phone], [Payment Link / Bank Account Details], [Late Fee Terms if applicable].\n\n"
+        "OUTPUT STRUCTURE:\n"
+        "1. Recommended Subject Line\n"
+        "2. Complete Message / Email Body (with clear placeholders for any missing details)\n"
+        "3. Recommended Next Steps (when to follow up next based on the due date status)."
+    )
+
+    user_prompt = (
+        f"Client Name: {client_name}\n"
+        f"Invoice Number: {invoice_id}\n"
+        f"Amount Due: ${amount_due:,.2f}\n"
+        f"Due Date: {invoice_due_date.strftime('%B %d, %Y')}\n"
+        f"Calculated Status: {status_label}\n"
+        f"Tone: {reminder_tone}\n"
+        f"Additional Context: {additional_context.strip() if additional_context.strip() else 'None provided'}"
+    )
+
+    meta = {
+        "status_category": status_cat,
+        "days_count": days_count,
+        "status_label": status_label,
+    }
+
+    return system_prompt, user_prompt, meta
+
+
+def calculate_monthly_financials(
+    rev_collected: float,
+    rev_pending: float,
+    total_exp: float,
+    tax_rate_est: float,
+) -> dict:
+    """
+    Calculates monthly financial totals, margins, and estimated tax reserves
+    strictly from actual user-supplied inputs.
+    """
+    total_billed = rev_collected + rev_pending
+    net_profit = rev_collected - total_exp
+    profit_margin_pct = (net_profit / rev_collected * 100.0) if rev_collected > 0 else 0.0
+    estimated_tax = max(0.0, net_profit * (tax_rate_est / 100.0))
+    take_home = max(0.0, net_profit - estimated_tax)
+    collection_rate_pct = (rev_collected / total_billed * 100.0) if total_billed > 0 else 100.0
+    expense_ratio_pct = (total_exp / rev_collected * 100.0) if rev_collected > 0 else 0.0
+
+    return {
+        "rev_collected": rev_collected,
+        "rev_pending": rev_pending,
+        "total_billed": total_billed,
+        "total_exp": total_exp,
+        "net_profit": net_profit,
+        "profit_margin_pct": profit_margin_pct,
+        "tax_rate_est": tax_rate_est,
+        "estimated_tax": estimated_tax,
+        "take_home": take_home,
+        "collection_rate_pct": collection_rate_pct,
+        "expense_ratio_pct": expense_ratio_pct,
+    }
+
+
+def build_monthly_summary_prompts(fin: dict) -> tuple[str, str]:
+    """
+    Builds prompts for Monthly Summary using strictly user-supplied figures.
+    Forbids universal benchmarks or guaranteed health claims.
+    """
+    system_prompt = (
+        "You are an analytical financial reviewer for freelancers and independent businesses.\n"
+        "Evaluate the monthly performance strictly based on the supplied actual figures.\n\n"
+        "STRICT EVALUATION GUIDELINES:\n"
+        "- Base all analysis ONLY on the supplied numbers. Do NOT invent figures or cite fictional industry averages.\n"
+        "- Do NOT claim universal profit margin benchmarks (e.g., claiming 'all freelancers must have 70% margins'). Profit margins vary widely by industry and business model.\n"
+        "- Do NOT guarantee financial health or outcomes. Provide objective observations on cash flow liquidity and outstanding collections.\n"
+        f"- Explicitly state that the tax reserve (${fin['estimated_tax']:,.2f}) is an estimate based strictly on the user-selected rate of {fin['tax_rate_est']}%.\n\n"
+        "STRUCTURE YOUR REPORT:\n"
+        "1. Cash Flow & Revenue Analysis (Collected vs Pending amounts)\n"
+        "2. Expense & Margin Observations (Operating expenses relative to collected revenue)\n"
+        "3. Tax Reserve Planning Note (Emphasizing this is a user-chosen estimate and subject to local tax rules)\n"
+        "4. Practical Observations to improve invoice collection speed.\n\n"
+        "MANDATORY DISCLAIMER:\n"
+        "Conclude with:\n"
+        "> ⚠️ **Disclaimer:** All totals, margins, and tax reserves are calculated from user-provided inputs and selected percentages. This summary is for organizational review only and does not constitute formal accounting, tax, or investment advice."
+    )
+
+    user_prompt = (
+        "User-Supplied Monthly Financial Performance:\n"
+        f"- Revenue Collected: ${fin['rev_collected']:,.2f}\n"
+        f"- Invoices Outstanding / Pending: ${fin['rev_pending']:,.2f}\n"
+        f"- Total Billed (Collected + Pending): ${fin['total_billed']:,.2f}\n"
+        f"- Total Operating Expenses: ${fin['total_exp']:,.2f}\n"
+        f"- Net Profit (Collected - Expenses): ${fin['net_profit']:,.2f}\n"
+        f"- Calculated Profit Margin: {fin['profit_margin_pct']:.1f}%\n"
+        f"- User-Selected Tax Reserve Rate: {fin['tax_rate_est']}%\n"
+        f"- Estimated Tax Reserve: ${fin['estimated_tax']:,.2f} (Estimated based on user-selected {fin['tax_rate_est']}%)\n"
+        f"- Estimated Take-Home: ${fin['take_home']:,.2f}\n"
+        f"- Collection Rate: {fin['collection_rate_pct']:.1f}% of billed revenue collected so far."
+    )
+
+    return system_prompt, user_prompt
+
+
 
 # -----------------------------------------------------------------------------
 # 3. Sidebar: Configuration & App Information
@@ -823,6 +1032,21 @@ with tab_expense:
         placeholder="e.g.,\n2026-10-02: Figma Subscription - $15.00\n2026-10-04: Client Lunch - $45.00\n2026-10-08: USB-C Hub - $35.00",
     )
 
+    tax_jurisdiction = st.selectbox(
+        label="Tax Jurisdiction (Optional)",
+        options=[
+            "Not specified",
+            "United States (IRS)",
+            "United Kingdom (HMRC)",
+            "Canada (CRA)",
+            "Australia (ATO)",
+            "European Union",
+            "India",
+            "Other",
+        ],
+        help="Tax deductibility rules vary significantly by country and business type. Leave as 'Not specified' if unsure.",
+    )
+
     if st.button("Categorize Expenses with AI", type="primary", key="btn_categorize_exp"):
         if not raw_expense_text.strip():
             st.warning("Please enter or load expense records first.")
@@ -830,23 +1054,14 @@ with tab_expense:
             st.error("Cannot process: GROQ_API_KEY is not configured. Please add your key in the sidebar or `.env`.")
         else:
             with st.spinner("Classifying expenses with openai/gpt-oss-20b..."):
-                system_prompt = (
-                    "You are a certified bookkeeping assistant for freelancers and small businesses. "
-                    "Examine the list of business transactions and organize them into a clean markdown table with:\n"
-                    "- Date\n"
-                    "- Description\n"
-                    "- Amount ($)\n"
-                    "- Category (e.g., Software & Subscriptions, Office Equipment, Meals & Entertainment, Travel, Hosting/Infrastructure)\n"
-                    "- Tax Deductible (Yes / Partially / No, with a brief 1-line reason)\n\n"
-                    "After the table, provide:\n"
-                    "1. Total Expenses ($)\n"
-                    "2. Spending Breakdown by Category\n"
-                    "3. Bookkeeping Advice / Tax Deductibility tip for freelance tax filing."
+                system_prompt, user_prompt = build_expense_categorizer_prompts(
+                    raw_expense_text=raw_expense_text,
+                    tax_jurisdiction=tax_jurisdiction,
                 )
                 result, error = call_groq_model(
                     api_key=active_api_key,
                     system_prompt=system_prompt,
-                    user_prompt=raw_expense_text,
+                    user_prompt=user_prompt,
                 )
 
                 if error:
@@ -855,6 +1070,7 @@ with tab_expense:
                     st.success("Expenses successfully categorized!")
                     st.markdown("### 📊 Categorized Expense Report")
                     st.markdown(result)
+
 
 
 # =============================================================================
@@ -894,18 +1110,43 @@ with tab_reminder:
                 label="Original Invoice Due Date",
                 value=date.today(),
             )
+
+            # Determine dynamic invoice timing status
+            status_cat, days_count, status_label = get_payment_reminder_status(invoice_due_date)
+
+            if status_cat == "upcoming":
+                tone_options = [
+                    "Friendly / Advance Notice (Upcoming)",
+                    "Gentle Reminder (Upcoming)",
+                ]
+            elif status_cat == "due_today":
+                tone_options = [
+                    "Friendly & Courteous (Due Today)",
+                    "Professional & Direct (Due Today)",
+                ]
+            else:
+                tone_options = [
+                    "Polite & Direct (Overdue Follow-Up)",
+                    "Firm & Professional (Overdue)",
+                    "Urgent Notice / Final Follow-Up (Overdue)",
+                ]
+
             reminder_tone = st.selectbox(
                 label="Reminder Tone",
-                options=[
-                    "Friendly / Gentle (Upcoming or Due Today)",
-                    "Polite & Direct (1 Week Overdue)",
-                    "Firm & Urgent (2+ Weeks Overdue / Final Notice)",
-                ],
+                options=tone_options,
             )
             additional_context = st.text_input(
                 label="Additional Context (Optional)",
                 placeholder="e.g., Client previously promised payment by Friday, project delivered on time.",
             )
+
+        # Show status indicator
+        if status_cat == "upcoming":
+            st.info(f"📅 **Invoice Timing Status:** {status_label}")
+        elif status_cat == "due_today":
+            st.warning(f"📅 **Invoice Timing Status:** {status_label}")
+        else:
+            st.error(f"📅 **Invoice Timing Status:** {status_label}")
 
         submit_reminder = st.form_submit_button("Generate Payment Reminder with AI", type="primary")
 
@@ -916,28 +1157,19 @@ with tab_reminder:
             st.error("Cannot process: GROQ_API_KEY is not configured. Please add your key in the sidebar or `.env`.")
         else:
             with st.spinner("Drafting payment reminder with openai/gpt-oss-20b..."):
-                prompt_content = (
-                    f"Client Name: {client_name}\n"
-                    f"Invoice Number: {invoice_id}\n"
-                    f"Amount Due: ${amount_due:,.2f}\n"
-                    f"Invoice Due Date: {invoice_due_date.strftime('%B %d, %Y')}\n"
-                    f"Selected Tone: {reminder_tone}\n"
-                    f"Context: {additional_context if additional_context else 'Standard follow-up'}"
-                )
-
-                system_prompt = (
-                    "You are a professional business communications specialist for independent contractors and freelancers. "
-                    "Draft an effective, courteous payment reminder email based on the supplied details and tone. "
-                    "Structure your output as follows:\n"
-                    "1. Recommended Subject Line\n"
-                    "2. Full Email Body (with clear placeholders like [Your Name], [Payment Link/Account Details])\n"
-                    "3. Strategic Advice (when to follow up next if unpaid)."
+                system_prompt, user_prompt, meta = build_payment_reminder_prompts(
+                    client_name=client_name,
+                    invoice_id=invoice_id,
+                    amount_due=amount_due,
+                    invoice_due_date=invoice_due_date,
+                    reminder_tone=reminder_tone,
+                    additional_context=additional_context,
                 )
 
                 result, error = call_groq_model(
                     api_key=active_api_key,
                     system_prompt=system_prompt,
-                    user_prompt=prompt_content,
+                    user_prompt=user_prompt,
                 )
 
                 if error:
@@ -946,6 +1178,7 @@ with tab_reminder:
                     st.success("Payment reminder drafted!")
                     st.markdown("### ✉️ Drafted Payment Reminder")
                     st.markdown(result)
+
 
 
 # =============================================================================
@@ -994,21 +1227,32 @@ with tab_summary:
             min_value=10,
             max_value=40,
             value=25,
-            help="Percentage of net profit recommended to save for self-employment taxes.",
+            help="Percentage of net profit recommended to save for self-employment taxes (user-selected estimate).",
         )
 
-    # Calculations
-    net_profit = rev_collected - total_exp
-    estimated_tax = max(0.0, net_profit * (tax_rate_est / 100.0))
-    take_home = max(0.0, net_profit - estimated_tax)
+    # Calculations strictly derived from actual supplied inputs
+    fin = calculate_monthly_financials(
+        rev_collected=rev_collected,
+        rev_pending=rev_pending,
+        total_exp=total_exp,
+        tax_rate_est=tax_rate_est,
+    )
 
     # Display KPI Cards
     st.markdown("#### 📈 Key Financial Metrics")
     kpi_col1, kpi_col2, kpi_col3, kpi_col4 = st.columns(4)
-    kpi_col1.metric("Revenue Collected", f"${rev_collected:,.2f}")
-    kpi_col2.metric("Total Expenses", f"${total_exp:,.2f}")
-    kpi_col3.metric("Net Profit", f"${net_profit:,.2f}")
-    kpi_col4.metric(f"Tax Reserve ({tax_rate_est}%)", f"${estimated_tax:,.2f}")
+    kpi_col1.metric("Revenue Collected", f"${fin['rev_collected']:,.2f}")
+    kpi_col2.metric("Total Expenses", f"${fin['total_exp']:,.2f}")
+    kpi_col3.metric(
+        "Net Profit",
+        f"${fin['net_profit']:,.2f}",
+        delta=f"{fin['profit_margin_pct']:.1f}% margin" if fin['rev_collected'] > 0 else None,
+    )
+    kpi_col4.metric(
+        f"Tax Reserve ({fin['tax_rate_est']}% estimate)",
+        f"${fin['estimated_tax']:,.2f}",
+        help=f"Estimated tax reserve based strictly on your selected rate of {fin['tax_rate_est']}% on net profit.",
+    )
 
     # Visual Comparison Chart using pandas & Streamlit
     st.markdown("#### 📊 Cash Flow Breakdown")
@@ -1019,16 +1263,16 @@ with tab_summary:
                 "Pending Invoices",
                 "Total Expenses",
                 "Net Profit",
-                "Tax Reserve",
+                f"Tax Reserve ({fin['tax_rate_est']}%)",
                 "Estimated Take-Home",
             ],
             "Amount ($)": [
-                rev_collected,
-                rev_pending,
-                total_exp,
-                net_profit,
-                estimated_tax,
-                take_home,
+                fin["rev_collected"],
+                fin["rev_pending"],
+                fin["total_exp"],
+                fin["net_profit"],
+                fin["estimated_tax"],
+                fin["take_home"],
             ],
         }
     )
@@ -1037,37 +1281,18 @@ with tab_summary:
 
     # AI Financial Advice Button
     st.markdown("#### 🧠 AI Financial Advisor")
-    st.caption("Generate actionable tips, risk analysis, and cash flow recommendations.")
+    st.caption("Generate actionable tips, risk analysis, and cash flow recommendations based strictly on your numbers.")
 
     if st.button("Generate Financial Insights with AI", type="primary", key="btn_summary_ai"):
         if not active_api_key:
             st.error("Cannot process: GROQ_API_KEY is not configured. Please add your key in the sidebar or `.env`.")
         else:
             with st.spinner("Analyzing financial figures with openai/gpt-oss-20b..."):
-                financial_context = (
-                    f"Monthly Financial Performance:\n"
-                    f"- Revenue Collected: ${rev_collected:,.2f}\n"
-                    f"- Invoices Outstanding / Pending: ${rev_pending:,.2f}\n"
-                    f"- Operating Expenses: ${total_exp:,.2f}\n"
-                    f"- Net Profit: ${net_profit:,.2f}\n"
-                    f"- Estimated Tax Reserve ({tax_rate_est}%): ${estimated_tax:,.2f}\n"
-                    f"- Estimated Take-Home Pay: ${take_home:,.2f}\n"
-                    f"- Outstanding Ratio: {((rev_pending / (rev_collected + rev_pending)) * 100) if (rev_collected + rev_pending) > 0 else 0:.1f}% of total billed is delayed."
-                )
-
-                system_prompt = (
-                    "You are a seasoned CFO and financial advisor for solo freelancers and small business owners. "
-                    "Analyze the provided monthly figures and deliver a concise, practical evaluation including:\n"
-                    "1. Financial Health Score (e.g., Healthy / Needs Attention / High Risk, with explanation)\n"
-                    "2. Cash Flow & Working Capital Assessment (addressing pending invoices vs collected revenue)\n"
-                    "3. Tax Readiness Advice\n"
-                    "4. 3 Actionable Recommendations to improve margins and speed up client collections next month."
-                )
-
+                system_prompt, user_prompt = build_monthly_summary_prompts(fin)
                 result, error = call_groq_model(
                     api_key=active_api_key,
                     system_prompt=system_prompt,
-                    user_prompt=financial_context,
+                    user_prompt=user_prompt,
                 )
 
                 if error:
@@ -1076,6 +1301,7 @@ with tab_summary:
                     st.success("Financial evaluation complete!")
                     st.markdown("### 💡 AI Financial Advisory Report")
                     st.markdown(result)
+
 
 
 # -----------------------------------------------------------------------------

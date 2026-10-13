@@ -10,6 +10,7 @@ from pathlib import Path
 root_dir = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(root_dir))
 
+from datetime import date
 from app import (
     clean_and_repair_json,
     safe_json_loads,
@@ -17,7 +18,13 @@ from app import (
     render_invoice_markdown,
     format_invoice_field,
     safe_float,
+    build_expense_categorizer_prompts,
+    get_payment_reminder_status,
+    build_payment_reminder_prompts,
+    calculate_monthly_financials,
+    build_monthly_summary_prompts,
 )
+
 
 
 class TestInvoiceJSONRepairAndParsing(unittest.TestCase):
@@ -244,6 +251,101 @@ class TestInvoiceValidationAndNonFabrication(unittest.TestCase):
         self.assertIsNone(data)
         self.assertIsNotNone(err)
         self.assertIn("No invoice details found", err)
+
+
+class TestExpenseCategorizerPrompts(unittest.TestCase):
+    """Test suite for Expense Categorizer jurisdiction awareness and disclaimers."""
+
+    def test_unspecified_jurisdiction_requires_needs_verification(self):
+        sys_p, user_p = build_expense_categorizer_prompts("2026-10-01: Coffee - $5.00", "Not specified")
+        self.assertIn("Needs verification", sys_p)
+        self.assertIn("General Disclaimer", sys_p)
+        self.assertIn("Tax Jurisdiction: Not specified", user_p)
+        self.assertIn("Do NOT make definitive tax deductibility claims", sys_p)
+
+    def test_specified_jurisdiction_includes_jurisdiction_and_disclaimer(self):
+        sys_p, user_p = build_expense_categorizer_prompts("2026-10-01: Software - $20.00", "United States (IRS)")
+        self.assertIn("United States (IRS)", user_p)
+        self.assertIn("United States (IRS)", sys_p)
+        self.assertIn("Do NOT make definitive tax claims", sys_p)
+        self.assertIn("General Disclaimer", sys_p)
+
+
+class TestPaymentReminderLogic(unittest.TestCase):
+    """Test suite for Payment Reminder date timing, non-fabrication, and placeholders."""
+
+    def test_upcoming_due_date_status(self):
+        today = date(2026, 10, 15)
+        future_date = date(2026, 10, 20)
+        cat, days, label = get_payment_reminder_status(future_date, current_date=today)
+        self.assertEqual(cat, "upcoming")
+        self.assertEqual(days, 5)
+        self.assertEqual(label, "Upcoming (Due in 5 days)")
+
+    def test_due_today_status(self):
+        today = date(2026, 10, 15)
+        cat, days, label = get_payment_reminder_status(today, current_date=today)
+        self.assertEqual(cat, "due_today")
+        self.assertEqual(days, 0)
+        self.assertEqual(label, "Due Today")
+
+    def test_overdue_status(self):
+        today = date(2026, 10, 15)
+        past_date = date(2026, 10, 10)
+        cat, days, label = get_payment_reminder_status(past_date, current_date=today)
+        self.assertEqual(cat, "overdue")
+        self.assertEqual(days, 5)
+        self.assertEqual(label, "Overdue by 5 days")
+
+    def test_prompts_forbid_describing_upcoming_as_overdue(self):
+        today = date(2026, 10, 15)
+        future_date = date(2026, 10, 22)
+        sys_p, user_p, meta = build_payment_reminder_prompts(
+            client_name="Test Corp",
+            invoice_id="INV-99",
+            amount_due=500.0,
+            invoice_due_date=future_date,
+            reminder_tone="Friendly / Advance Notice (Upcoming)",
+            current_date=today,
+        )
+        self.assertEqual(meta["status_category"], "upcoming")
+        self.assertIn("do NOT describe it as overdue, past due, or late", sys_p)
+        self.assertIn("Do NOT invent bank details", sys_p)
+        self.assertIn("[Payment Link / Bank Account Details]", sys_p)
+        self.assertIn("[Your Name]", sys_p)
+
+
+class TestMonthlySummaryCalculations(unittest.TestCase):
+    """Test suite for Monthly Summary actual calculations and tax reserve estimates."""
+
+    def test_calculation_from_supplied_inputs(self):
+        fin = calculate_monthly_financials(
+            rev_collected=5000.0,
+            rev_pending=2000.0,
+            total_exp=1500.0,
+            tax_rate_est=25.0,
+        )
+        self.assertEqual(fin["total_billed"], 7000.0)
+        self.assertEqual(fin["net_profit"], 3500.0)
+        self.assertEqual(fin["profit_margin_pct"], 70.0)
+        self.assertEqual(fin["estimated_tax"], 875.0)
+        self.assertEqual(fin["take_home"], 2625.0)
+        self.assertAlmostEqual(fin["collection_rate_pct"], (5000.0 / 7000.0) * 100.0)
+
+    def test_prompts_require_user_selected_estimates_and_forbid_universal_benchmarks(self):
+        fin = calculate_monthly_financials(
+            rev_collected=4000.0,
+            rev_pending=1000.0,
+            total_exp=1000.0,
+            tax_rate_est=30.0,
+        )
+        sys_p, user_p = build_monthly_summary_prompts(fin)
+        self.assertIn("Do NOT claim universal profit margin benchmarks", sys_p)
+        self.assertIn("Do NOT guarantee financial health or outcomes", sys_p)
+        self.assertIn("estimate based strictly on the user-selected rate of 30.0%", sys_p)
+        self.assertIn("Revenue Collected: $4,000.00", user_p)
+        self.assertIn("Operating Expenses: $1,000.00", user_p)
+        self.assertIn("Net Profit (Collected - Expenses): $3,000.00", user_p)
 
 
 if __name__ == "__main__":
